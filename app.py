@@ -2,39 +2,60 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
+from tiingo import TiingoClient
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from pandas.tseries.offsets import MonthEnd, MonthBegin
 import math
+import os
 import time
 
 # Streamlit app title
 st.title("Trade Like a Quant Portfolio App")
 
-# --- Data Pull Function (Updated) ---
+# --- Tiingo Setup ---
+tiingo_api_key = os.getenv("TIINGO_API_KEY")
+if not tiingo_api_key:
+    st.error("Tiingo API key not found. Please set the TIINGO_API_KEY environment variable.")
+    st.stop()
+
+config = {
+    'api_key': tiingo_api_key,
+    'session': True  # Reuse HTTP sessions for better performance
+}
+client = TiingoClient(config)
+
+# --- Data Pull Function (Using Tiingo) ---
 @st.cache_data
-def fetch_yahoo_data(tickers, start_date="2010-01-01", end_date=str(datetime.today().date())):
+def fetch_tiingo_data(tickers, start_date="2010-01-01", end_date=str(datetime.today().date())):
     data = {}
     for ticker in tickers:
         for attempt in range(3):
             try:
-                df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                # Remove '^' from indices for Tiingo (e.g., ^VIX -> VIX)
+                tiingo_ticker = ticker.replace('^', '')
+                df = client.get_dataframe(
+                    tiingo_ticker,
+                    startDate=start_date,
+                    endDate=end_date,
+                    frequency='daily'
+                )
                 if df.empty:
-                    st.warning(f"No data for {ticker}")
+                    st.warning(f"No data for {ticker} from Tiingo")
                     continue
-                required_cols = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
-                missing_cols = [col for col in required_cols if col not in df.columns]
-                if missing_cols:
-                    st.warning(f"Missing columns {missing_cols} for {ticker}. Using 'Close' as fallback.")
-                    for col in missing_cols:
-                        df[col] = df['Close'] if col == 'Adj Close' else 0
-                df = df[required_cols].reset_index()
+                df = df.reset_index()
                 df['ticker'] = ticker
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.rename(columns={'Close': 'close', 'Adj Close': 'unadjusted_close', 'Date': 'date'})
-                data[ticker] = df[['date', 'ticker', 'close', 'unadjusted_close', 'Volume']]
+                df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)  # Remove timezone
+                df = df.rename(columns={
+                    'close': 'close',
+                    'adjClose': 'unadjusted_close',
+                    'volume': 'Volume'
+                })
+                # Ensure required columns
+                required_cols = ['date', 'ticker', 'close', 'unadjusted_close', 'Volume']
+                df = df[required_cols]
+                data[ticker] = df
                 break
             except Exception as e:
                 st.warning(f"Attempt {attempt + 1} failed for {ticker}: {e}")
@@ -48,6 +69,7 @@ def fetch_yahoo_data(tickers, start_date="2010-01-01", end_date=str(datetime.tod
     prices = pd.concat(data.values(), ignore_index=True)
     prices = prices.sort_values(['date', 'ticker']).reset_index(drop=True)
     
+    # VIX data with fallback for VIX3M
     vix_data = data.get('^VIX', pd.DataFrame()).rename(columns={'close': 'VIX'})
     vix3m_data = data.get('^VIX3M', pd.DataFrame()).rename(columns={'close': 'VIX3M'})
     if not vix_data.empty:
@@ -234,7 +256,7 @@ def run_backtest(prices, rp_df, flow_df, vrp_df, portfolio_value, max_leverage, 
     
     return portfolio, combined, deltas
 
-# --- Input Controls (Updated) ---
+# --- Input Controls ---
 st.sidebar.header("Portfolio Settings")
 portfolio_value = st.sidebar.number_input("Portfolio Value ($)", min_value=1000, value=100000, step=1000)
 max_leverage = st.sidebar.slider("Max Leverage", min_value=0.5, max_value=2.0, value=1.0, step=0.1)
@@ -280,10 +302,10 @@ vrp_lookback = st.sidebar.slider("VRP Volatility Lookback (days)", 60, 500, 120,
 
 # --- Fetch Data ---
 tickers = ['VTI', 'TLT', 'GLD', 'SVXY', 'VIXY', '^VIX', '^VIX3M']
-prices, vol_idxs = fetch_yahoo_data(tickers)
+prices, vol_idxs = fetch_tiingo_data(tickers)
 
 if prices.empty or (vol_idxs.empty and not prices[prices['ticker'].isin(['SVXY', 'VIXY'])].empty):
-    st.error("Failed to load data. Please try again or check logs.")
+    st.error("Failed to load data. Please check your Tiingo API key or try again later.")
 else:
     # --- Run Strategies ---
     target_vols = {'VTI': rp_vol_stock, 'TLT': rp_vol_bond, 'GLD': rp_vol_gold}
